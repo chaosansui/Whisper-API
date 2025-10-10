@@ -278,21 +278,21 @@ class WhisperASR:
         }
         
         # 基于检测到的语言进行优化
-        if detected_language == "yue":
+        if detected_language == "Cantonese":
             base_params.update({
                 "temperature": 0.15,
                 "num_beams": 12,
                 "repetition_penalty": 1.3,
                 "no_repeat_ngram_size": 4
             })
-        elif detected_language == "en":
+        elif detected_language == "English":
             base_params.update({
-                "temperature": 0.15,
-                "num_beams": 12,
-                "repetition_penalty": 1.25,
+                "temperature": 0.1,
+                "num_beams": 8,
+                "repetition_penalty": 1.1,
                 "no_repeat_ngram_size": 3
             })
-        elif detected_language == "zh":
+        elif detected_language == "Chinese":
             base_params.update({
                 "temperature": 0.2,
                 "num_beams": 10,

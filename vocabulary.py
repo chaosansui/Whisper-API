@@ -138,29 +138,29 @@ class Vocabulary:
 
     def get_corrections_for_language(self, language):
         """获取指定语言的词汇替换表"""
-        if language == "yue":
+        if language == "Cantonese":
             return self.cantonese_corrections
-        elif language == "en":
+        elif language == "English":
             return {**self.english_corrections, **self.industry_terms, **self.colloquial_expressions}
-        elif language == "zh":
+        elif language == "Chinese":
             return self.chinese_corrections
         else:
             return {}
 
     def add_custom_vocabulary(self, language, corrections_dict):
         """添加自定义词汇"""
-        if language == "yue":
+        if language == "Cantonese":
             self.cantonese_corrections.update(corrections_dict)
-        elif language == "en":
+        elif language == "English":
             self.english_corrections.update(corrections_dict)
-        elif language == "zh":
+        elif language == "Chinese":
             self.chinese_corrections.update(corrections_dict)
 
     def remove_vocabulary(self, language, word):
         """移除词汇"""
-        if language == "yue" and word in self.cantonese_corrections:
+        if language == "Cantonese" and word in self.cantonese_corrections:
             del self.cantonese_corrections[word]
-        elif language == "en" and word in self.english_corrections:
+        elif language == "English" and word in self.english_corrections:
             del self.english_corrections[word]
-        elif language == "zh" and word in self.chinese_corrections:
+        elif language == "Chinese" and word in self.chinese_corrections:
             del self.chinese_corrections[word]

@@ -45,15 +45,15 @@ class PostProcessor:
         text = text.strip()
         
         # 语言特定处理
-        if language == "yue":
+        if language == "Cantonese":
             text = self.postprocess_cantonese(text)
-        elif language == "en":
+        elif language == "English":
             text = self.postprocess_english(text)
-        elif language == "zh":
+        elif language == "Chinese":
             text = self.postprocess_chinese(text)
         
         # 首字母大写
-        if text and language in ["en"]:
+        if text and language in ["English"]:
             text = text[0].upper() + text[1:]
         
         return text
@@ -64,7 +64,7 @@ class PostProcessor:
             return text
         
         # 词汇替换
-        corrections = self.vocabulary.get_corrections_for_language("yue")
+        corrections = self.vocabulary.get_corrections_for_language("Cantonese")
         for wrong, correct in corrections.items():
             text = text.replace(wrong, correct)
         
@@ -81,7 +81,7 @@ class PostProcessor:
             return text
         
         # 词汇替换
-        corrections = self.vocabulary.get_corrections_for_language("en")
+        corrections = self.vocabulary.get_corrections_for_language("English")
         for wrong, correct in corrections.items():
             # 使用单词边界确保完整单词匹配
             text = re.sub(r'\b' + re.escape(wrong) + r'\b', correct, text)
@@ -99,7 +99,7 @@ class PostProcessor:
             return text
         
         # 词汇替换
-        corrections = self.vocabulary.get_corrections_for_language("zh")
+        corrections = self.vocabulary.get_corrections_for_language("Chinese")
         for wrong, correct in corrections.items():
             text = text.replace(wrong, correct)
         
