@@ -1,117 +1,116 @@
-import re
 import logging
-from typing import Optional
+from typing import Dict, Optional
 from vocabulary import Vocabulary
 
 logger = logging.getLogger(__name__)
 
 class PostProcessor:
-    """后处理器"""
+    """后处理器 - 负责文本清理和统一词汇矫正"""
     
     def __init__(self):
         self.vocabulary = Vocabulary()
-        self.setup_patterns()
-    
-    def setup_patterns(self):
-        """设置正则表达式模式"""
-        # 清理模式
-        self.clean_patterns = [
-            (r'[^\w\s\u4e00-\u9fff.,!?;:，。！？；：\-()（）]', ''),  # 移除非法字符
-            (r'\s+', ' '),  # 合并多个空格
-            (r'([.!?。！？])([^\s])', r'\1 \2'),  # 标点后添加空格
-        ]
-        
-        # 粤语特定模式
-        self.cantonese_patterns = [
-            (r'(唔)([^係要好錯])', r'\1 \2'),  # 粤语"唔"后加空格
-            (r'(嘅)([^\.。!！?？,，])', r'\1 \2'),  # 粤语"嘅"后加空格
-        ]
-        
-        # 英文特定模式
-        self.english_patterns = [
-            (r'\b(\w+)\s+\1\b', r'\1'),  # 移除重复单词
-            (r'\bi\b', 'I'),  # 小写i改为大写
-        ]
+        logger.info("✅ 后处理器初始化完成")
 
-    def clean_text(self, text: str, language: Optional[str] = None) -> str:
-        """清理转录文本"""
-        if not text or not isinstance(text, str):
+    def clean_text(self, text: str, language: str = "auto") -> str:
+        """清理和矫正文本 - 不区分语言，统一矫正"""
+        if not text or not text.strip():
             return ""
         
-        # 基础清理
-        for pattern, replacement in self.clean_patterns:
-            text = re.sub(pattern, replacement, text)
+        # 基础文本清理
+        cleaned_text = self._basic_clean(text)
         
+        # 🎯 统一词汇矫正（不区分语言）
+        corrected_text = self._apply_unified_corrections(cleaned_text)
+        
+        # 最终格式清理
+        final_text = self._final_clean(corrected_text)
+        
+        return final_text
+
+    def _basic_clean(self, text: str) -> str:
+        """基础文本清理"""
+        if not text:
+            return ""
+        
+        # 移除多余空格
+        text = ' '.join(text.split())
+        
+        # 移除特殊字符但保留标点
+        import re
+        text = re.sub(r'[^\w\s\u4e00-\u9fff.,!?;:()\-]', '', text)
+        
+        return text.strip()
+
+    def _apply_unified_corrections(self, text: str) -> str:
+        """应用统一词汇矫正 - 修复包含空格的短语匹配"""
+        if not text:
+            return ""
+        
+        # 获取所有矫正词汇
+        corrections = self.vocabulary.get_all_corrections()
+        
+        if not corrections:
+            return text
+        
+        # 按短语长度降序排序（先匹配长短语）
+        sorted_corrections = sorted(corrections.items(), key=lambda x: len(x[0]), reverse=True)
+        
+        corrected_text = text
+        corrections_applied = []
+        
+        for wrong, correct in sorted_corrections:
+            # 🎯 修复：对包含空格的短语使用直接字符串替换
+            if ' ' in wrong:
+                # 对于包含空格的短语，使用直接替换
+                if wrong in corrected_text:
+                    corrected_text = corrected_text.replace(wrong, correct)
+                    corrections_applied.append((wrong, correct))
+            else:
+                # 对于单个单词，使用单词边界确保准确替换
+                import re
+                pattern = r'\b' + re.escape(wrong) + r'\b'
+                if re.search(pattern, corrected_text):
+                    corrected_text = re.sub(pattern, correct, corrected_text)
+                    corrections_applied.append((wrong, correct))
+        
+        # 记录矫正情况（如果有变化）
+        if corrections_applied:
+            logger.info(f"🎯 统一词汇矫正: 应用了 {len(corrections_applied)} 个矫正")
+            for wrong, correct in corrections_applied:
+                logger.info(f"   '{wrong}' -> '{correct}'")
+        
+        return corrected_text
+
+    def _final_clean(self, text: str) -> str:
+        """最终文本清理"""
+        if not text:
+            return ""
+        
+        # 移除首尾空格
         text = text.strip()
         
-        # 语言特定处理
-        if language == "Cantonese":
-            text = self.postprocess_cantonese(text)
-        elif language == "English":
-            text = self.postprocess_english(text)
-        elif language == "Chinese":
-            text = self.postprocess_chinese(text)
-        
-        # 首字母大写
-        if text and language in ["English"]:
-            text = text[0].upper() + text[1:]
+        # 确保句子以标点结尾
+        if text and text[-1] not in '.!?。！？':
+            text += '.'
         
         return text
 
-    def postprocess_cantonese(self, text: str) -> str:
-        """粤语转录后处理"""
-        if not text:
-            return text
-        
-        # 词汇替换
-        corrections = self.vocabulary.get_corrections_for_language("Cantonese")
-        for wrong, correct in corrections.items():
-            text = text.replace(wrong, correct)
-        
-        # 模式处理
-        for pattern, replacement in self.cantonese_patterns:
-            text = re.sub(pattern, replacement, text)
-        
-        logger.debug(f"粤语后处理结果: {text}")
-        return text
+    def add_custom_correction(self, wrong: str, correct: str):
+        """添加自定义词汇矫正"""
+        self.vocabulary.add_custom_correction(wrong, correct)
 
-    def postprocess_english(self, text: str) -> str:
-        """英文转录后处理"""
-        if not text:
-            return text
-        
-        # 词汇替换
-        corrections = self.vocabulary.get_corrections_for_language("English")
-        for wrong, correct in corrections.items():
-            # 使用单词边界确保完整单词匹配
-            text = re.sub(r'\b' + re.escape(wrong) + r'\b', correct, text)
-        
-        # 模式处理
-        for pattern, replacement in self.english_patterns:
-            text = re.sub(pattern, replacement, text)
-        
-        logger.debug(f"英文后处理结果: {text}")
-        return text
+    def batch_add_corrections(self, corrections: Dict[str, str]):
+        """批量添加词汇矫正"""
+        self.vocabulary.batch_add_corrections(corrections)
 
-    def postprocess_chinese(self, text: str) -> str:
-        """中文转录后处理"""
-        if not text:
-            return text
-        
-        # 词汇替换
-        corrections = self.vocabulary.get_corrections_for_language("Chinese")
-        for wrong, correct in corrections.items():
-            text = text.replace(wrong, correct)
-        
-        logger.debug(f"中文后处理结果: {text}")
-        return text
+    def remove_correction(self, word: str):
+        """移除词汇矫正"""
+        self.vocabulary.remove_correction(word)
 
-    def add_custom_correction(self, language: str, wrong: str, correct: str):
-        """添加自定义修正"""
-        self.vocabulary.add_custom_vocabulary(language, {wrong: correct})
-        logger.info(f"添加自定义修正: {language} - {wrong} -> {correct}")
+    def get_vocabulary_stats(self) -> Dict[str, int]:
+        """获取词汇表统计"""
+        return self.vocabulary.get_vocabulary_stats()
 
-    def batch_add_corrections(self, language: str, corrections: dict):
-        """批量添加修正"""
-        self.vocabulary.add_custom_vocabulary(language, corrections)
-        logger.info(f"批量添加 {len(corrections)} 个 {language} 修正")
+    def search_corrections(self, keyword: str) -> Dict[str, str]:
+        """搜索相关矫正项"""
+        return self.vocabulary.search_corrections(keyword)

@@ -1,476 +1,558 @@
 import torch
-import logging
-import time
-import traceback
-import re
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Tuple
-
+import time
+import logging
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from silero_vad import load_silero_vad, get_speech_timestamps
-
-from config import MODEL_PATH, OPTIMIZATION_CONFIG, DEVICE
-from audio_processor import AudioProcessor
+from config import Config
 from post_processor import PostProcessor
+from audio_processor import AudioProcessor
 
 logger = logging.getLogger(__name__)
 
 class WhisperASR:
-    """Whisper ASR 核心类 - 完全自动语言识别"""
-    
     def __init__(self):
-        """初始化 WhisperASR"""
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA 不可用")
-
-        self.device = DEVICE
-        torch.cuda.set_device(0)
-        logger.info(f"使用设备: {self.device}, GPU: {torch.cuda.get_device_name(0)}")
-
+        self.device = Config.DEVICE
         self.whisper_model = None
         self.processor = None
-        self.vad_model = None
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        self.model_loaded = False
-        
-        # 初始化处理模块
-        self.audio_processor = AudioProcessor(sample_rate=OPTIMIZATION_CONFIG["sample_rate"])
         self.post_processor = PostProcessor()
+        self.audio_processor = AudioProcessor()
+        self.model_loaded = False
+        self.context_cache = {}
         
-        # 配置
-        self.optimization_config = OPTIMIZATION_CONFIG
-        self.SAMPLE_RATE = OPTIMIZATION_CONFIG["sample_rate"]
-        
-        self.supported_languages = [
-            'English', 'Chinese', 'Cantonese', 'Japanese', 'Korean', 'Vietnamese'
-        ]
-
-    def log_memory(self, stage: str):
-        """记录 GPU 内存使用情况"""
-        if self.device.type == "cuda":
-            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            allocated_memory = torch.cuda.memory_allocated(0) / 1024**3
-            free_memory = total_memory - allocated_memory
-            logger.info(f"{stage}: 可用 {free_memory:.2f} GiB / 总共 {total_memory:.2f} GiB")
-
-    def clear_gpu_memory(self):
-        """清理 GPU 内存"""
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-            self.log_memory("清理后内存")
-
-    def load_models(self, model_path=MODEL_PATH):
-        """加载 Whisper 和 VAD 模型"""
+    def load_models(self):
+        """简化模型加载"""
+        if self.model_loaded:
+            return
+            
         try:
-            self.clear_gpu_memory()
             logger.info("🔄 加载 Whisper 模型...")
-            self.processor = WhisperProcessor.from_pretrained(
-                model_path, 
-                num_mel_bins=self.optimization_config["n_mels"]
-            )
+            
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+                initial_memory = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"📊 加载前显存: {initial_memory:.1f}G")
+            
+            self.processor = WhisperProcessor.from_pretrained(Config.MODEL_PATH)
+            
             self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
-                model_path,
+                Config.MODEL_PATH,
                 torch_dtype=torch.float16,
-                device_map="auto"
+                device_map="auto",
+                low_cpu_mem_usage=True
             ).to(self.device)
+            
             self.whisper_model.eval()
-            self.log_memory("Whisper 模型加载后内存")
             
-            logger.info("🔄 加载 Silero VAD 模型...")
-            self.vad_model = load_silero_vad(onnx=True)
-            self.vad_get_speech_timestamps = get_speech_timestamps
-            logger.info("✅ Silero VAD 模型加载完成")
-            
+            for param in self.whisper_model.parameters():
+                param.requires_grad = False
+                
             self.model_loaded = True
-            self.log_memory("所有模型加载后内存")
-            logger.info("✅ 所有模型加载完成")
-            self.warmup_model()
+            
+            if self.device.type == "cuda":
+                after_memory = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"✅ 模型加载完成 - 显存占用: {after_memory:.1f}G")
+            
         except Exception as e:
             logger.error(f"❌ 模型加载失败: {str(e)}")
-            self.model_loaded = False
             raise
 
-    def warmup_model(self):
-        """模型预热，提高首次推理速度"""
-        logger.info("🔥 预热模型...")
-        try:
-            t = np.linspace(0, 1, self.SAMPLE_RATE)
-            dummy_audio = 0.1 * np.sin(2 * np.pi * 300 * t)
-            dummy_audio = dummy_audio.astype(np.float32)
-            inputs = self.processor(
-                dummy_audio,
-                sampling_rate=self.SAMPLE_RATE,
-                return_tensors="pt"
-            )
-            input_features = inputs["input_features"].to(self.device)
-            model_dtype = next(self.whisper_model.parameters()).dtype
-            input_features = input_features.to(model_dtype)
-            with torch.no_grad():
-                # 预热多种语言
-                _ = self.whisper_model.generate(
-                    input_features,
-                    task="transcribe",
-                    max_length=10,
-                    num_beams=1
-                )
-            logger.info("✅ 模型预热完成")
-        except Exception as e:
-            logger.warning(f"模型预热失败: {e}, 继续启动")
-
-    def detect_language(self, audio_np, segment_duration=5.0, retries=3):
-        """完全自动语言检测"""
-        try:
-            sample_length = min(int(segment_duration * self.SAMPLE_RATE), len(audio_np))
-            if sample_length < 8000:  # 确保至少0.5秒音频
-                sample_length = min(8000, len(audio_np))
-            sample_audio = audio_np[:sample_length]
-            
-            inputs = self.processor(
-                sample_audio,
-                sampling_rate=self.SAMPLE_RATE,
-                return_tensors="pt"
-            )
-            input_features = inputs["input_features"].to(self.device)
-            model_dtype = next(self.whisper_model.parameters()).dtype
-            input_features = input_features.to(model_dtype)
-            
-            with torch.no_grad():
-                # 让模型自动检测语言
-                generated_ids = self.whisper_model.generate(
-                    input_features,
-                    task="transcribe",
-                    max_new_tokens=10,
-                    return_dict_in_generate=True,
-                    output_scores=True
-                )
-                
-                # 从生成的token中提取语言信息
-                lang_tokens = generated_ids.sequences[0]
-                detected_languages = []
-                
-                for token in lang_tokens:
-                    lang_code = self.processor.tokenizer.convert_ids_to_tokens([token])[0]
-                    lang_code = re.sub(r'[<>]', '', lang_code).strip().lower()
-                    if lang_code in self.supported_languages:
-                        detected_languages.append(lang_code)
-                
-                logger.info(f"自动语言检测结果: {detected_languages}")
-                
-                # 返回检测到的第一个有效语言
-                if detected_languages:
-                    detected_lang = detected_languages[0]
-                    logger.info(f"自动检测到语言: {detected_lang}")
-                    return detected_lang
-                
-                if retries > 0:
-                    logger.warning(f"语言检测结果为空，剩余重试次数: {retries}，尝试更短片段")
-                    return self.detect_language(audio_np, segment_duration=segment_duration/2, retries=retries-1)
-                
-                logger.warning("未检测到有效语言，使用自动模式")
-                return "auto"
-                
-        except Exception as e:
-            logger.warning(f"语言检测失败: {e}，剩余重试次数: {retries}")
-            if retries > 0:
-                return self.detect_language(audio_np, segment_duration=segment_duration/2, retries=retries-1)
-            logger.warning("语言检测失败，使用自动模式")
-            return "auto"
-
-    def optimize_vad_parameters(self, audio_tensor):
-        """优化VAD参数"""
-        energy = torch.mean(torch.abs(audio_tensor))
-        energy_std = torch.std(torch.abs(audio_tensor))
-        logger.info(f"音频能量水平: {energy:.4f}, 能量标准差: {energy_std:.4f}")
-        
-        if energy < 0.002:
-            return {
-                "threshold": 0.05,
-                "min_silence_duration_ms": 50,
-                "min_speech_duration_ms": 50,
-                "speech_pad_ms": 10
-            }
-        elif energy < 0.015:
-            return {
-                "threshold": 0.02,
-                "min_silence_duration_ms": 150,
-                "min_speech_duration_ms": 80,
-                "speech_pad_ms": 20
-            }
-        elif energy > 0.08:
-            return {
-                "threshold": 0.20,
-                "min_silence_duration_ms": 100,
-                "min_speech_duration_ms": 150,
-                "speech_pad_ms": 50
-            }
-        else:
-            return {
-                "threshold": 0.05,
-                "min_silence_duration_ms": 60,
-                "min_speech_duration_ms": 100,
-                "speech_pad_ms": 30
-            }
-
-    def adaptive_vad_processing(self, audio_tensor):
-        """自适应VAD处理"""
-        vad_params = self.optimize_vad_parameters(audio_tensor)
-        logger.info(f"使用VAD参数: {vad_params}")
-        
-        speech_timestamps = self.vad_get_speech_timestamps(
-            audio_tensor,
-            self.vad_model,
-            sampling_rate=self.SAMPLE_RATE,
-            **vad_params,
-            return_seconds=False
-        )
-        
-        if not speech_timestamps:
-            logger.info("尝试更宽松的VAD参数...")
-            fallback_params = [
-                {"threshold": 0.008, "min_silence_duration_ms": 30, "min_speech_duration_ms": 50, "speech_pad_ms": 10},
-                {"threshold": 0.01, "min_silence_duration_ms": 20, "min_speech_duration_ms": 30, "speech_pad_ms": 5},
-                {"threshold": 0.005, "min_silence_duration_ms": 10, "min_speech_duration_ms": 20, "speech_pad_ms": 5},
-                {"threshold": 0.001, "min_silence_duration_ms": 10, "min_speech_duration_ms": 10, "speech_pad_ms": 5}
-            ]
-            
-            for params in fallback_params:
-                logger.info(f"使用回退VAD参数: {params}")
-                speech_timestamps = self.vad_get_speech_timestamps(
-                    audio_tensor,
-                    self.vad_model,
-                    sampling_rate=self.SAMPLE_RATE,
-                    **params,
-                    return_seconds=False
-                )
-                if speech_timestamps:
-                    break
-        
-        # 强制分段
-        max_segment_duration = 30 * self.SAMPLE_RATE  # 30秒
-        final_timestamps = []
-        for segment in speech_timestamps:
-            start = segment['start']
-            end = segment['end']
-            segment_duration = end - start
-            if segment_duration > max_segment_duration:
-                num_splits = int(np.ceil(segment_duration / max_segment_duration))
-                split_duration = segment_duration // num_splits
-                for i in range(num_splits):
-                    split_start = start + i * split_duration
-                    split_end = min(split_start + split_duration, end)
-                    final_timestamps.append({'start': split_start, 'end': split_end})
-            else:
-                final_timestamps.append(segment)
-        
-        logger.info(f"VAD 检测到 {len(final_timestamps)} 个语音片段")
-        return final_timestamps
-
-    def optimize_generation_parameters(self, audio_duration, audio_quality=0.5, detected_language=None):
-        """优化生成参数 - 基于检测到的语言自动优化"""
-        base_params = {
-            "max_length": int(audio_duration * 60),
-            "num_beams": 12,
-            "temperature": 0.2,
-            "no_repeat_ngram_size": 3,
-            "early_stopping": False,
-            "repetition_penalty": 1.2
-        }
-        
-        # 基于检测到的语言进行优化
-        if detected_language == "Cantonese":
-            base_params.update({
-                "temperature": 0.15,
-                "num_beams": 12,
-                "repetition_penalty": 1.3,
-                "no_repeat_ngram_size": 4
-            })
-        elif detected_language == "English":
-            base_params.update({
-                "temperature": 0.1,
-                "num_beams": 8,
-                "repetition_penalty": 1.1,
-                "no_repeat_ngram_size": 3
-            })
-        elif detected_language == "Chinese":
-            base_params.update({
-                "temperature": 0.2,
-                "num_beams": 10,
-                "repetition_penalty": 1.2
-            })
-        
-        # 基于音频时长调整
-        if audio_duration > 60:
-            base_params.update({
-                "max_length": int(audio_duration * 80),
-                "num_beams": 8
-            })
-        elif audio_duration < 5:
-            base_params.update({
-                "max_length": 256,
-                "num_beams": 6,
-                "early_stopping": True
-            })
-        
-        # 基于音频质量调整
-        if audio_quality < 0.4:
-            base_params.update({
-                "num_beams": 14,
-                "repetition_penalty": 1.5
-            })
-            
-        return base_params
-
-    def transcribe_segment(self, segment, segment_duration, detected_language="auto", audio_quality=0.5):
-        """转录单个音频片段"""
-        try:
-            gen_params = self.optimize_generation_parameters(segment_duration, audio_quality, detected_language)
-            
-            inputs = self.processor(
-                segment,
-                sampling_rate=self.SAMPLE_RATE,
-                return_tensors="pt"
-            )
-            input_features = inputs["input_features"].to(self.device)
-            model_dtype = next(self.whisper_model.parameters()).dtype
-            input_features = input_features.to(model_dtype)
-            
-            with torch.no_grad():
-                # 让模型自动处理语言
-                if detected_language != "auto":
-                    gen_params["language"] = detected_language
-                
-                generated_ids = self.whisper_model.generate(
-                    input_features,
-                    task="transcribe",
-                    **gen_params
-                )
-            
-            transcription = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            
-            # 根据检测到的语言进行后处理
-            final_transcription = self.clean_text(transcription, detected_language)
-            return final_transcription
-            
-        except Exception as e:
-            logger.error(f"片段转录失败: {e}")
-            return ""
-
-    def transcribe_with_vad(self, audio_np, audio_duration, audio_quality=0.5):
-        """使用VAD分段转录"""
-        logger.info("使用VAD分段处理音频")
-        audio_tensor = torch.from_numpy(audio_np).float().to("cpu")
-        if len(audio_tensor.shape) > 1:
-            audio_tensor = torch.mean(audio_tensor, dim=1)
-            
-        speech_timestamps = self.adaptive_vad_processing(audio_tensor)
-        all_transcriptions = []
-        
-        for i, segment_info in enumerate(speech_timestamps):
-            start_sample = segment_info['start']
-            end_sample = segment_info['end']
-            segment = audio_np[start_sample:end_sample]
-            segment_duration = (end_sample - start_sample) / self.SAMPLE_RATE
-            
-            logger.info(f"处理片段 {i+1}/{len(speech_timestamps)}: 时长: {segment_duration:.2f}秒")
-            
-            # 为每个片段检测语言
-            segment_language = self.detect_language(segment, segment_duration=min(1.0, segment_duration))
-            transcription = self.transcribe_segment(segment, segment_duration, segment_language, audio_quality)
-            
-            if transcription:
-                all_transcriptions.append(transcription)
-                logger.info(f"片段 {i+1} 转录结果: {transcription} (语言: {segment_language})")
-            
-            torch.cuda.empty_cache()
-        
-        final_transcription = " ".join(all_transcriptions)
-        return final_transcription, "mixed"
-
-    def transcribe_full_audio(self, audio_np, audio_duration, audio_quality=0.5):
-        """直接处理完整音频"""
-        logger.info("🔄 直接处理完整音频...")
-        
-        # 检测整体语言
-        detected_language = self.detect_language(audio_np)
-        logger.info(f"完整音频检测到语言: {detected_language}")
-        
-        # 分块处理长音频
-        chunk_duration = 30  # 每块30秒
-        num_chunks = int(np.ceil(audio_duration / chunk_duration))
-        all_transcriptions = []
-        
-        for i in range(num_chunks):
-            start_sample = int(i * chunk_duration * self.SAMPLE_RATE)
-            end_sample = min(int((i + 1) * chunk_duration * self.SAMPLE_RATE), len(audio_np))
-            chunk = audio_np[start_sample:end_sample]
-            chunk_duration_actual = (end_sample - start_sample) / self.SAMPLE_RATE
-            
-            logger.info(f"处理音频块 {i+1}/{num_chunks}: 时长: {chunk_duration_actual:.2f}秒")
-            
-            transcription = self.transcribe_segment(chunk, chunk_duration_actual, detected_language, audio_quality)
-            
-            if transcription:
-                all_transcriptions.append(transcription)
-            
-            torch.cuda.empty_cache()
-        
-        final_transcription = " ".join(all_transcriptions)
-        logger.info(f"完整音频转录结果: {final_transcription}")
-        return final_transcription, detected_language
-
-    def transcribe_audio(self, audio_bytes, forced_language=None):
-        """转录完整音频 - 完全自动语言识别"""
+    def transcribe_audio(self, audio_bytes: bytes, forced_language: str = None, 
+                    session_id: str = None, use_context: bool = True) -> tuple:
+        """主转录接口 - 使用 Silero VAD 分割 + 信任VAD机制"""
         if not self.model_loaded:
-            logger.error("模型未加载")
-            return "模型未加载，请检查服务状态", "unknown"
-        
+            return "模型未加载", "error"
+            
         try:
             start_time = time.time()
             
-            # 处理音频
-            audio_np = self.process_audio(audio_bytes)
-            audio_np = self.enhance_telephone_audio(audio_np)
-            audio_duration = len(audio_np) / self.SAMPLE_RATE
-            audio_quality = self.estimate_audio_quality(audio_np)
+            # 1. 基础音频预处理
+            logger.info("🎯 步骤1: 音频预处理")
+            audio_np = self.audio_processor.preprocess_audio(audio_bytes)
+            audio_duration = len(audio_np) / 16000
+            logger.info(f"预处理完成: {len(audio_np)}样本, {audio_duration:.2f}秒")
             
-            logger.info(f"增强后音频时长: {audio_duration:.2f}秒, 质量: {audio_quality:.2f}")
+            # 2. 音频验证（基础检查）
+            if not self.audio_processor.validate_audio(audio_np):
+                logger.warning("音频质量验证失败，返回空结果")
+                return "未检测到有效语音", "auto"
             
-            # 完全自动语言处理
-            if audio_duration > 10:  # 长音频使用VAD分段
-                transcription, final_language = self.transcribe_with_vad(audio_np, audio_duration, audio_quality)
-            else:  # 短音频直接处理
-                transcription, final_language = self.transcribe_full_audio(audio_np, audio_duration, audio_quality)
+            # 3. 获取上下文提示词（如果启用）
+            prompt_text = "粤语客服对话"
+            if use_context and session_id and session_id in self.context_cache:
+                prompt_text = self.context_cache[session_id]
+                logger.info(f"📝 使用上下文提示词: {prompt_text[:100]}...")
             
-            logger.info(f"转录总耗时: {time.time() - start_time:.2f}秒")
-            return transcription if transcription else "未检测到语音", final_language
+            # 4. 使用 VAD 进行语音分割
+            logger.info("🎯 步骤2: VAD 语音活动检测")
+            speech_segments = self.audio_processor.vad_segmentation(audio_np)
+            
+            if not speech_segments:
+                logger.warning("VAD 未检测到语音片段")
+                return "未检测到语音", "auto"
+            
+            logger.info(f"✅ VAD 检测到 {len(speech_segments)} 个语音片段")
+            
+            # 🎯 调试：打印每个原始片段的长度和基本信息
+            total_speech_duration = 0
+            for i, segment in enumerate(speech_segments):
+                duration = len(segment) / 16000
+                energy = np.mean(np.abs(segment))
+                total_speech_duration += duration
+                logger.info(f"原始片段 {i+1}: {duration:.2f}秒, {len(segment)}样本, 能量: {energy:.6f}")
+            
+            speech_ratio = total_speech_duration / audio_duration if audio_duration > 0 else 0
+            logger.info(f"语音统计: 总语音时长 {total_speech_duration:.2f}秒, 语音占比 {speech_ratio:.1%}")
+            
+            # 5. 智能合并短片段以满足 Whisper 要求
+            merged_segments = self._merge_short_segments(speech_segments, min_duration=15.0)
+            logger.info(f"片段合并后: {len(speech_segments)} → {len(merged_segments)} 个片段")
+            
+            # 🎯 特殊逻辑：如果合并后片段减少很多，说明有很多短语音
+            if len(merged_segments) < len(speech_segments) * 0.5:
+                logger.info("🔊 检测到大量短语音片段，可能是重叠说话场景，确保全部转录")
+            
+            # 如果合并后还是没有有效片段，尝试直接使用原始音频
+            if not merged_segments:
+                logger.warning("合并后无有效片段，尝试使用原始音频")
+                merged_segments = [self._pad_to_min_duration(audio_np, 15.0)]
+            
+            # 🎯 最终验证：确保所有片段都满足Whisper要求
+            validated_segments = []
+            for i, segment in enumerate(merged_segments):
+                segment_duration = len(segment) / 16000
+                if segment_duration < 30.0:  # Whisper要求30秒
+                    logger.info(f"最终填充片段 {i+1}: {segment_duration:.2f}秒 → 30.00秒")
+                    segment = self._pad_to_min_duration(segment, 30.0)
+                validated_segments.append(segment)
+                logger.info(f"✅ 最终片段 {i+1}: {len(segment)/16000:.2f}秒")
+            
+            # 6. 转录处理 - 信任所有VAD检测到的片段
+            if len(validated_segments) == 1:
+                # 单个片段直接处理
+                logger.info("📦 单一片段，直接转录")
+                transcription, detected_language = self._transcribe_chunk(
+                    validated_segments[0], forced_language, is_first_chunk=True, prompt_text=prompt_text
+                )
+            else:
+                # 多个片段使用上下文传递
+                logger.info("📦 多片段，使用上下文转录")
+                transcription, detected_language = self._transcribe_vad_segments(
+                    validated_segments, forced_language, prompt_text
+                )
+            
+            # 7. 更新上下文缓存（如果启用）
+            if use_context and session_id and transcription and transcription.strip():
+                self._update_context_cache(session_id, transcription, detected_language)
+            
+            total_time = time.time() - start_time
+            
+            # 🎯 性能统计
+            if transcription and transcription.strip():
+                chars_per_second = len(transcription) / total_time if total_time > 0 else 0
+                logger.info(f"✅ 转录完成 - 语言: {detected_language}, "
+                        f"音频时长: {audio_duration:.2f}秒, "
+                        f"处理耗时: {total_time:.2f}秒, "
+                        f"转录速度: {chars_per_second:.1f}字/秒")
+            else:
+                logger.warning(f"⚠️ 转录完成但无有效结果 - 语言: {detected_language}, "
+                            f"音频时长: {audio_duration:.2f}秒, "
+                            f"处理耗时: {total_time:.2f}秒")
+            
+            return transcription, detected_language
             
         except Exception as e:
-            logger.error(f"转录失败: {str(e)}")
-            traceback.print_exc()
+            logger.error(f"❌ 转录失败: {str(e)}")
             return f"转录失败: {str(e)}", "error"
 
-    # 使用新的音频处理器和后处理器的方法
-    def process_audio(self, audio_bytes):
-        """处理音频数据 - 使用新的音频处理器"""
-        return self.audio_processor.process_audio(audio_bytes)
+    def _merge_short_segments(self, segments: list, min_duration: float = 15.0) -> list:
+        """智能合并短片段以满足 Whisper 要求"""
+        if not segments:
+            return []
+        
+        # 如果只有一个片段，直接检查长度
+        if len(segments) == 1:
+            single_segment = segments[0]
+            if len(single_segment) < min_duration * 16000:
+                return [self._pad_to_min_duration(single_segment, min_duration)]
+            return segments
+        
+        merged_segments = []
+        current_batch = [segments[0]]
+        current_total_duration = len(segments[0]) / 16000
+        
+        for i in range(1, len(segments)):
+            segment = segments[i]
+            segment_duration = len(segment) / 16000
+            
+            # 如果合并后不超过25秒，就继续合并
+            if current_total_duration + segment_duration <= 25.0:
+                current_batch.append(segment)
+                current_total_duration += segment_duration
+            else:
+                # 合并当前批次
+                if current_batch:
+                    merged_segment = self._merge_batch_segments(current_batch)
+                    merged_segments.append(merged_segment)
+                
+                # 开始新的批次
+                current_batch = [segment]
+                current_total_duration = segment_duration
+        
+        # 处理最后一批
+        if current_batch:
+            merged_segment = self._merge_batch_segments(current_batch)
+            merged_segments.append(merged_segment)
+        
+        # 确保所有片段都满足最小长度
+        final_segments = []
+        for segment in merged_segments:
+            if len(segment) < min_duration * 16000:
+                padded_segment = self._pad_to_min_duration(segment, min_duration)
+                final_segments.append(padded_segment)
+            else:
+                final_segments.append(segment)
+        
+        logger.info(f"智能合并完成: {len(segments)} → {len(final_segments)} 个片段")
+        
+        # 调试信息：打印每个最终片段的长度
+        for i, segment in enumerate(final_segments):
+            duration = len(segment) / 16000
+            logger.info(f"最终片段 {i+1}: {duration:.2f}秒")
+        
+        return final_segments
 
-    def estimate_audio_quality(self, audio_np):
-        """估计音频质量 - 使用新的音频处理器"""
-        return self.audio_processor.estimate_audio_quality(audio_np)
+    def _merge_batch_segments(self, batch_segments: list) -> np.ndarray:
+        """合并一批片段，添加适当的静音间隔"""
+        if not batch_segments:
+            return np.array([])
+        
+        if len(batch_segments) == 1:
+            return batch_segments[0]
+        
+        merged_segments = []
+        for i, segment in enumerate(batch_segments):
+            merged_segments.append(segment)
+            # 在片段之间添加0.3秒静音（除了最后一个）
+            if i < len(batch_segments) - 1:
+                silence = np.zeros(int(0.3 * 16000))
+                merged_segments.append(silence)
+        
+        return np.concatenate(merged_segments)
 
-    def enhance_telephone_audio(self, audio_np):
-        """增强电话录音质量 - 使用新的音频处理器"""
-        return self.audio_processor.enhance_telephone_audio(audio_np)
+    def _pad_to_min_duration(self, audio_np: np.ndarray, min_duration: float) -> np.ndarray:
+        """将音频填充到最小持续时间"""
+        target_samples = int(min_duration * 16000)
+        
+        if len(audio_np) >= target_samples:
+            return audio_np
+        
+        # 计算需要填充的静音长度
+        padding_needed = target_samples - len(audio_np)
+        
+        # 在前后各填充一半的静音
+        pad_before = padding_needed // 2
+        pad_after = padding_needed - pad_before
+        
+        padded_audio = np.pad(audio_np, (pad_before, pad_after), mode='constant')
+        logger.info(f"音频填充: {len(audio_np)/16000:.2f}秒 → {min_duration}秒")
+        
+        return padded_audio
 
-    def clean_text(self, text, language=None):
-        """清理转录文本 - 使用新的后处理器"""
-        return self.post_processor.clean_text(text, language)
+    def _transcribe_vad_segments(self, segments: list, forced_language: str = None, 
+                               initial_prompt: str = "") -> tuple:
+        """转录 VAD 分割的多个语音片段"""
+        all_transcriptions = []
+        detected_language = "auto"
+        current_prompt = initial_prompt
+        
+        for i, segment in enumerate(segments):
+            segment_duration = len(segment) / 16000
+            logger.info(f"处理语音片段 {i+1}/{len(segments)} (时长: {segment_duration:.2f}秒)")
+            
+            if current_prompt:
+                logger.info(f"📝 使用提示词: {current_prompt[-100:]}...")
+            
+            segment_transcription, segment_language = self._transcribe_chunk(
+                segment, forced_language, 
+                is_first_chunk=(i == 0),
+                prompt_text=current_prompt
+            )
+            
+            if segment_transcription and segment_transcription.strip():
+                all_transcriptions.append(segment_transcription)
+                
+                # 更新提示词：将当前识别结果作为下一段的提示
+                current_prompt = self._truncate_prompt(current_prompt + " " + segment_transcription)
+                logger.info(f"✅ 片段 {i+1} 转录成功，更新提示词")
+            else:
+                logger.warning(f"⚠️ 片段 {i+1} 无有效转录")
+                # 即使转录失败，也保留之前的提示词
+            
+            # 记录第一个片段检测到的语言
+            if i == 0 and segment_language and segment_language != "auto":
+                detected_language = segment_language
+        
+        # 合并结果
+        final_transcription = self._merge_transcriptions(all_transcriptions)
+        logger.info(f"🔗 合并完成: {len(all_transcriptions)}个片段 -> {len(final_transcription)}字符")
+        
+        return final_transcription, detected_language
 
-    def add_custom_correction(self, language: str, wrong: str, correct: str):
-        """添加自定义修正"""
-        self.post_processor.add_custom_correction(language, wrong, correct)
+    def _transcribe_chunk(self, chunk: np.ndarray, forced_language: str = None, 
+                         is_first_chunk: bool = False, prompt_text: str = "") -> tuple:
+        """转录单个音频块 - 完整修复版"""
+        try:
+            # 🎯 关键修复：在开始时严格验证输入长度
+            chunk_duration = len(chunk) / 16000
+            logger.info(f"转录开始验证: 输入音频{chunk_duration:.2f}秒, {len(chunk)}样本")
+            
+            # 根据实际测试，Whisper-large-v3 需要30秒输入
+            REQUIRED_DURATION = 30.0
+            if chunk_duration < REQUIRED_DURATION:
+                logger.warning(f"输入音频不足30秒: {chunk_duration:.2f}秒, 强制填充到30秒")
+                chunk = self._pad_to_min_duration(chunk, REQUIRED_DURATION)
+                chunk_duration = len(chunk) / 16000
+                logger.info(f"填充后: {chunk_duration:.2f}秒")
+            
+            # 🎯 关键修改：极宽松的能量检测，只过滤完全静音
+            energy = np.mean(np.abs(chunk))
+            logger.info(f"音频能量参考值: {energy:.6f}")
+            
+            # 只过滤能量接近0的完全静音
+            if energy < 0.0001:
+                logger.warning(f"能量极低，可能为误检静音 (能量: {energy:.6f})")
+                return "", "auto"
+            
+            # 🎯 特殊提示：中等能量可能是重叠说话
+            if energy < 0.005:
+                logger.info(f"检测到可能的重叠说话或轻语音 (能量: {energy:.6f})，继续转录")
 
-    def batch_add_corrections(self, language: str, corrections: dict):
-        """批量添加修正"""
-        self.post_processor.batch_add_corrections(language, corrections)
+            generation_params = {
+                "task": "transcribe",
+                "num_beams": 1,
+                "temperature": 0.0,
+                "no_repeat_ngram_size": 3,
+                "compression_ratio_threshold": 2.4,
+                "logprob_threshold": -1.0,
+                "no_speech_threshold": 0.6,
+            }
+            
+            if forced_language and forced_language != "auto":
+                generation_params["language"] = forced_language
+            
+            # 兼容的提示词处理方式
+            if prompt_text and prompt_text.strip():
+                try:
+                    # 方式1：使用 text 参数（新版本 transformers）
+                    inputs = self.processor(
+                        chunk,
+                        sampling_rate=16000,
+                        return_tensors="pt",
+                        padding=True,
+                        text=prompt_text
+                    )
+                    logger.debug(f"使用提示词(新方式): {prompt_text[:50]}...")
+                except Exception as e:
+                    logger.warning(f"新提示词方式失败: {e}，尝试传统方式")
+                    # 方式2：传统方式
+                    inputs = self.processor(
+                        chunk,
+                        sampling_rate=16000,
+                        return_tensors="pt",
+                        padding=True
+                    )
+                    # 在生成参数中设置提示词
+                    prompt_tokens = self.processor(text=prompt_text, return_tensors="pt").input_ids
+                    generation_params["forced_decoder_ids"] = self._create_forced_decoder_ids(prompt_tokens)
+            else:
+                inputs = self.processor(
+                    chunk,
+                    sampling_rate=16000,
+                    return_tensors="pt",
+                    padding=True
+                )
+            
+            input_features = inputs["input_features"].to(self.device, dtype=torch.float16)
+            
+            with torch.inference_mode():
+                generated_ids = self.whisper_model.generate(input_features, **generation_params)
+            
+            raw_transcription = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            # 过滤空结果
+            if not raw_transcription.strip() or len(raw_transcription.strip()) < 2:
+                logger.warning("转录结果为空或过短")
+                return "", "auto"
+            
+            detected_language = "auto"
+            if is_first_chunk and not forced_language:
+                detected_language = self._detect_language_from_ids(generated_ids)
+            
+            # 使用后处理器清理和矫正文本
+            transcription = self.post_processor.clean_text(raw_transcription)
+            
+            # 清理内存
+            del input_features, generated_ids
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            logger.info(f"片段转录结果: {transcription[:100]}...")
+            return transcription, detected_language
+            
+        except Exception as e:
+            logger.error(f"音频片段转录失败: {e}")
+            # 尝试不使用提示词重新转录
+            if prompt_text:
+                logger.info("尝试不使用提示词重新转录...")
+                try:
+                    return self._transcribe_chunk(chunk, forced_language, is_first_chunk, "")
+                except:
+                    return "", "auto"
+            return "", "auto"
+
+    def _create_forced_decoder_ids(self, prompt_tokens):
+        """创建强制解码器ID（兼容旧版本）"""
+        forced_decoder_ids = []
+        for i, token_id in enumerate(prompt_tokens[0]):
+            forced_decoder_ids.append([i + 1, token_id])
+        return forced_decoder_ids
+
+    def _truncate_prompt(self, prompt: str, max_tokens: int = 200) -> str:
+        """截断提示词以避免过长"""
+        if not prompt or len(prompt) < 50:
+            return prompt
+        
+        max_chars = max_tokens * 3
+        if len(prompt) <= max_chars:
+            return prompt
+        
+        truncated = prompt[-max_chars:]
+        sentence_breaks = ['。', '！', '？', '.', '!', '?', '，', ',']
+        
+        for break_char in sentence_breaks:
+            break_pos = truncated.find(break_char)
+            if break_pos > 10:
+                truncated = truncated[break_pos + 1:].lstrip()
+                break
+        
+        logger.debug(f"提示词截断: {len(prompt)} -> {len(truncated)} 字符")
+        return truncated
+
+    def _merge_transcriptions(self, transcriptions: list) -> str:
+        """合并多个转录结果"""
+        if not transcriptions:
+            return "未检测到语音"
+        
+        merged = " ".join(transcriptions)
+        
+        # 基础去重
+        words = merged.split()
+        if len(words) > 10:
+            for i in range(len(words) - 6):
+                if words[i:i+3] == words[i+3:i+6]:
+                    merged = " ".join(words[:i+3] + words[i+6:])
+                    logger.info("检测并移除了重复内容")
+                    break
+        
+        return merged
+
+    def _update_context_cache(self, session_id: str, transcription: str, language: str):
+        """更新上下文缓存"""
+        max_sessions = 100
+        max_length = 800
+        
+        if len(self.context_cache) >= max_sessions:
+            first_key = next(iter(self.context_cache))
+            del self.context_cache[first_key]
+            logger.info(f"上下文缓存已满，移除会话: {first_key}")
+        
+        truncated_text = transcription[:max_length] if len(transcription) > max_length else transcription
+        self.context_cache[session_id] = truncated_text
+        logger.info(f"更新会话 {session_id} 的上下文缓存: {len(truncated_text)} 字符")
+
+    def clear_context_cache(self, session_id: str = None):
+        """清理上下文缓存"""
+        if session_id:
+            if session_id in self.context_cache:
+                del self.context_cache[session_id]
+                logger.info(f"已清理会话 {session_id} 的上下文缓存")
+        else:
+            self.context_cache.clear()
+            logger.info("已清理所有上下文缓存")
+
+    def _detect_language_from_ids(self, generated_ids: torch.Tensor) -> str:
+        """从生成的token中检测语言"""
+        try:
+            if generated_ids.numel() == 0:
+                return "auto"
+                
+            first_tokens = generated_ids[0][:2]
+            decoded = self.processor.decode(first_tokens)
+            
+            if '<|en|>' in decoded:
+                return "en"
+            elif '<|zh|>' in decoded:
+                return "zh" 
+            elif '<|yue|>' in decoded:
+                return "yue"
+            else:
+                return "auto"
+                
+        except Exception as e:
+            logger.warning(f"语言检测失败: {e}")
+            return "auto"
+
+    def clear_gpu_memory(self):
+        """清理GPU内存"""
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            logger.info("✅ GPU内存已清理")
+
+    def get_model_info(self) -> dict:
+        """获取模型信息"""
+        if not self.model_loaded:
+            return {"status": "模型未加载"}
+        
+        info = {
+            "status": "模型已加载",
+            "model_name": "Whisper-large-v3",
+            "device": str(self.device),
+            "sample_rate": "16kHz",
+            "supported_languages": ["auto", "yue", "zh", "en"],
+            "processing_flow": "VAD语音分割 → 片段合并 → Whisper转录 → 词汇矫正",
+            "vocabulary_stats": self.get_vocabulary_stats(),
+            "context_cache_size": len(self.context_cache),
+            "features": [
+                "Silero VAD语音检测",
+                "智能片段合并", 
+                "提示词上下文连贯性", 
+                "自动语言检测",
+                "统一词汇矫正"
+            ]
+        }
+        
+        if self.device.type == "cuda":
+            info["gpu_memory_allocated"] = f"{torch.cuda.memory_allocated() / 1024**3:.1f}G"
+            
+        return info
+
+    # 词汇处理相关方法保持不变
+    def add_custom_correction(self, wrong: str, correct: str):
+        """添加自定义词汇矫正"""
+        self.post_processor.add_custom_correction(wrong, correct)
+
+    def batch_add_corrections(self, corrections: dict):
+        """批量添加词汇矫正"""
+        self.post_processor.batch_add_corrections(corrections)
+
+    def remove_correction(self, word: str):
+        """移除词汇矫正"""
+        self.post_processor.remove_correction(word)
+
+    def get_vocabulary_stats(self):
+        """获取词汇表统计"""
+        return self.post_processor.get_vocabulary_stats()
+
+    def search_corrections(self, keyword: str):
+        """搜索相关矫正项"""
+        return self.post_processor.search_corrections(keyword)

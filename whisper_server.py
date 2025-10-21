@@ -201,7 +201,7 @@ class WhisperASR:
         """优化语言检测，支持粤语+英文混合"""
         try:
             sample_length = min(int(segment_duration * self.SAMPLE_RATE), len(audio_np))
-            if sample_length < 8000:  # 确保至少0.5秒音频
+            if sample_length < 8000:
                 sample_length = min(8000, len(audio_np))
             sample_audio = audio_np[:sample_length]
             inputs = self.processor(
