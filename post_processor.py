@@ -1,6 +1,7 @@
 import logging
-from typing import Dict, Optional
-from vocabulary import Vocabulary
+import re
+from typing import Dict, List, Tuple
+from vocabulary import UnifiedVocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -8,7 +9,7 @@ class PostProcessor:
     """后处理器 - 负责文本清理和统一词汇矫正"""
     
     def __init__(self):
-        self.vocabulary = Vocabulary()
+        self.vocabulary = UnifiedVocabulary()
         logger.info("✅ 后处理器初始化完成")
 
     def clean_text(self, text: str, language: str = "auto") -> str:
@@ -16,14 +17,21 @@ class PostProcessor:
         if not text or not text.strip():
             return ""
         
+        # 记录原始文本用于调试
+        original_text = text
+        
         # 基础文本清理
         cleaned_text = self._basic_clean(text)
         
-        # 🎯 统一词汇矫正（不区分语言）
         corrected_text = self._apply_unified_corrections(cleaned_text)
         
-        # 最终格式清理
+    
         final_text = self._final_clean(corrected_text)
+        
+        if original_text != final_text:
+            logger.info(f"📝 文本矫正前后对比:")
+            logger.info(f"   原始: {original_text}")
+            logger.info(f"   矫正: {final_text}")
         
         return final_text
 
@@ -32,17 +40,14 @@ class PostProcessor:
         if not text:
             return ""
         
-        # 移除多余空格
         text = ' '.join(text.split())
         
-        # 移除特殊字符但保留标点
-        import re
         text = re.sub(r'[^\w\s\u4e00-\u9fff.,!?;:()\-]', '', text)
         
         return text.strip()
 
     def _apply_unified_corrections(self, text: str) -> str:
-        """应用统一词汇矫正 - 修复包含空格的短语匹配"""
+        """应用统一词汇矫正 - 简化版本"""
         if not text:
             return ""
         
@@ -52,32 +57,24 @@ class PostProcessor:
         if not corrections:
             return text
         
-        # 按短语长度降序排序（先匹配长短语）
-        sorted_corrections = sorted(corrections.items(), key=lambda x: len(x[0]), reverse=True)
-        
         corrected_text = text
         corrections_applied = []
         
-        for wrong, correct in sorted_corrections:
-            # 🎯 修复：对包含空格的短语使用直接字符串替换
-            if ' ' in wrong:
-                # 对于包含空格的短语，使用直接替换
-                if wrong in corrected_text:
-                    corrected_text = corrected_text.replace(wrong, correct)
-                    corrections_applied.append((wrong, correct))
-            else:
-                # 对于单个单词，使用单词边界确保准确替换
-                import re
-                pattern = r'\b' + re.escape(wrong) + r'\b'
-                if re.search(pattern, corrected_text):
-                    corrected_text = re.sub(pattern, correct, corrected_text)
-                    corrections_applied.append((wrong, correct))
+        sorted_corrections = sorted(corrections.items())
         
-        # 记录矫正情况（如果有变化）
+        for wrong, correct in sorted_corrections:
+            before_count = corrected_text.count(wrong)
+            
+            if before_count > 0:
+                corrected_text = corrected_text.replace(wrong, correct)
+                corrections_applied.append((wrong, correct, before_count))
+        
         if corrections_applied:
-            logger.info(f"🎯 统一词汇矫正: 应用了 {len(corrections_applied)} 个矫正")
-            for wrong, correct in corrections_applied:
-                logger.info(f"   '{wrong}' -> '{correct}'")
+            total_corrections = sum(count for _, _, count in corrections_applied)
+            logger.info(f"🎯 统一词汇矫正: 应用了 {len(corrections_applied)} 种矫正，共 {total_corrections} 处")
+            
+            for wrong, correct, count in corrections_applied:
+                logger.info(f"   '{wrong}' -> '{correct}' (x{count})")
         
         return corrected_text
 
@@ -86,31 +83,61 @@ class PostProcessor:
         if not text:
             return ""
         
-        # 移除首尾空格
         text = text.strip()
-        
-        # 确保句子以标点结尾
+
         if text and text[-1] not in '.!?。！？':
             text += '.'
         
         return text
 
+    def debug_corrections(self, text: str) -> Dict[str, any]:
+        """调试词汇矫正情况"""
+        corrections = self.vocabulary.get_all_corrections()
+        debug_info = {
+            "original_text": text,
+            "total_correction_rules": len(corrections),
+            "matched_corrections": [],
+            "corrected_text": self.clean_text(text)
+        }
+        
+        for wrong, correct in corrections.items():
+            if wrong in text:
+                debug_info["matched_corrections"].append({
+                    "wrong": wrong,
+                    "correct": correct,
+                    "count": text.count(wrong)
+                })
+        
+        return debug_info
+
+    def list_all_corrections(self) -> List[Tuple[str, str]]:
+        """列出所有矫正规则"""
+        corrections = self.vocabulary.get_all_corrections()
+        return [(k, v) for k, v in corrections.items()]
+
     def add_custom_correction(self, wrong: str, correct: str):
         """添加自定义词汇矫正"""
         self.vocabulary.add_custom_correction(wrong, correct)
+        logger.info(f"✅ 已添加矫正规则: '{wrong}' -> '{correct}'")
 
     def batch_add_corrections(self, corrections: Dict[str, str]):
         """批量添加词汇矫正"""
         self.vocabulary.batch_add_corrections(corrections)
+        logger.info(f"✅ 批量添加 {len(corrections)} 个矫正规则")
 
     def remove_correction(self, word: str):
         """移除词汇矫正"""
         self.vocabulary.remove_correction(word)
+        logger.info(f"✅ 已移除矫正规则: '{word}'")
 
     def get_vocabulary_stats(self) -> Dict[str, int]:
         """获取词汇表统计"""
-        return self.vocabulary.get_vocabulary_stats()
+        stats = self.vocabulary.get_vocabulary_stats()
+        logger.info(f"📊 词汇表统计: {stats}")
+        return stats
 
     def search_corrections(self, keyword: str) -> Dict[str, str]:
         """搜索相关矫正项"""
-        return self.vocabulary.search_corrections(keyword)
+        results = self.vocabulary.search_corrections(keyword)
+        logger.info(f"🔍 搜索 '{keyword}': 找到 {len(results)} 个相关矫正")
+        return results
