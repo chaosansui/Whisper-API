@@ -1,5 +1,4 @@
 import os
-# 设置 CUDA 设备和内存管理策略
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -14,6 +13,8 @@ from typing import Optional
 import time
 from whisper_asr import WhisperASR
 from config import Config
+import setproctitle   
+setproctitle.setproctitle("whisper")
 
 # 配置日志
 logging.basicConfig(level=Config.LOGGING["level"], format=Config.LOGGING["format"])

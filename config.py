@@ -7,7 +7,7 @@ class Config:
     """简化配置管理"""
     
     # 路径配置
-    MODEL_PATH = "/mnt/data/models/audio/whisper-large-v3"
+    MODEL_PATH = "/mnt/data/models/audio/whisper"
     CACHE_DIR = "./cache"
     
     # 设备配置
@@ -16,7 +16,7 @@ class Config:
     # API 配置
     API = {
         "host": "0.0.0.0",
-        "port": 8008,
+        "port": 8001,
         "timeout_keep_alive": 300,
         "log_level": "info",
         "max_file_size": 100 * 1024 * 1024
