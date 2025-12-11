@@ -10,16 +10,13 @@ class UnifiedVocabulary:
         logger.info(f"✅ 统一词汇表加载完成: 共 {len(self.corrections)} 个矫正项")
 
     def _load_unified_vocabulary(self) -> Dict[str, str]:
-        """加载统一词汇表 - 不区分语言"""
+        """加载统一词汇表"""
         corrections = {
-            # 公司/品牌名称
             'Punky Finance': 'Funky Finance',
             "www. funky. com. jk": "www.funky.com.hk",
-            
-            # 金融术语
             '新聞證': '身份證',
             '銀碼': '金額',
-            'OK': '額度',  # 在贷款上下文中
+            'OK': '額度',
             '票': '支票',
             '刷成': '調整為',
             '改資料': '修改資料',
@@ -29,25 +26,20 @@ class UnifiedVocabulary:
             '退了': '推遲',
             '收': '收取',
             
-            # 粤语常用词
             "是不是": "係唔係", "这样": "咁樣", "那个": "嗰個", 
             "这里": "呢度", "为什么": "點解", "没有": "冇",
             "的": "嘅", "他": "佢", "我们": "我哋", "什么": "咩",
             
-            # 英语拼写矫正
             "there": "their", "your": "you're", "its": "it's", 
             "to": "too", "then": "than", "weather": "whether",
             "mortage": "mortgage", "intrest": "interest",
             
-            # 中文错别字
             "登陆": "登录", "帐号": "账号", "其它": "其他",
             "部份": "部分", "重起": "重启", "按装": "安装",
             
-            # 口语化表达
             "gonna": "going to", "wanna": "want to", 
             "kinda": "kind of", "sorta": "sort of",
             
-            # 专业术语统一
             "账户": "戶口", "密码": "密碼", "转账": "過數", 
             "余额": "餘額", "贷款": "貸款", "投资": "投資",
         }

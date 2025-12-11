@@ -423,7 +423,7 @@ class WhisperASR:
                 if speech_timestamps:
                     break
         # 强制分段
-        max_segment_duration = 30 * self.SAMPLE_RATE  # 30秒
+        max_segment_duration = 30 * self.SAMPLE_RATE 
         final_timestamps = []
         for segment in speech_timestamps:
             start = segment['start']
