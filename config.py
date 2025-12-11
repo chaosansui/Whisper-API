@@ -7,11 +7,16 @@ class Config:
     """简化配置管理"""
     
     # 路径配置
-    MODEL_PATH = "/mnt/data/models/audio/whisper"
+    MODEL_PATH = "/home/jinhui/data/internvl_deploy/models/whisper-large-v3"
     CACHE_DIR = "./cache"
     
     # 设备配置
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # 转译文本配置，采用模型
+    Local_model_url = "http://localhost:8111/v1/chat/completions"
+    Local_model_name = "Qwen3"
+    
     
     # API 配置
     API = {
@@ -40,7 +45,7 @@ class Config:
     def get_device_info(cls) -> Dict[str, Any]:
         """获取设备信息"""
         info = {"device": str(cls.DEVICE)}
-        if cls.DEVICE.type == "cuda":
+        if cls.DEVICE.type == "cuda:0":
             info.update({
                 "gpu_name": torch.cuda.get_device_name(0),
                 "gpu_memory": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
